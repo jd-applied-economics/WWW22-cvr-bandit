@@ -18,3 +18,4 @@ Alternatively, adaptive approaches such as "multi-armed bandits" are able to eff
 Multi-armed Bandit, Delayed Feedback, Conversion Rate (CVR), Display Ads, Experimentation Platform, Deployed System
 
 ## Simulation Code
+[Paper Simulation Code](paper_appendix_simulation.Rmd)

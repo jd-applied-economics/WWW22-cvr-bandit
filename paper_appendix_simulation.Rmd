@@ -1,0 +1,1710 @@
+---
+title: "Simulation"
+output:
+  html_document:
+    df_print: paged
+---
+
+
+```{r warning=FALSE, include=FALSE}
+library(tidyverse)
+library(foreach)
+library(doParallel)
+library(doSNOW)
+library(scales)
+library(ggprism)
+library(knitr)
+# library(kableExtra)
+```
+
+
+## Simulate one experiment
+
+```{r func_simu_one_exp}
+## Simulate one experiment
+# p_click: prob of clicking
+# p_c:  prob of conversion given clicks
+# lambda_delay: parameter for delay distribution (expo distribution)
+# mean of the delay is 1/lambda_delay
+# obs: number of period
+# weibull: if TRUE, use weibull distribution
+# weibull_shape: weibull shape param, used only when weibull is TRUE.
+
+simulate_one_experiment <- function(p_click = c(0.5, 0.6),
+                                    p_c = c(0.01, 0.012),
+                                    lambda_delay = c(1 / 500, 1 / 500),
+                                    obs = 30000,
+                                    weibull = FALSE,
+                                    weibull_shape = 1.5,
+                                    seed = NULL) {
+  if (!is.null(seed)) {
+    set.seed(seed)
+  }
+  # number of arms
+  K <- length(p_click)
+  stopifnot(length(p_c) == K & length(lambda_delay) == K)
+
+  # simulate clicks, latent conversion, latent delays
+  t <- seq(obs)
+  clicks <- rbinom(obs * K, 1, p_click) %>% matrix(nrow = obs, byrow = TRUE)
+  lat_convs <- rbinom(obs * K, 1, p_c) %>% matrix(nrow = obs, byrow = TRUE) * (clicks)
+
+  if (weibull) {
+    lat_delays <- rweibull(obs * K, weibull_shape, 1 / lambda_delay) %>% matrix(nrow = obs, byrow = TRUE) * (lat_convs) + -1 * (1 - lat_convs)
+  } else {
+    lat_delays <- rexp(obs * K, lambda_delay) %>% matrix(nrow = obs, byrow = TRUE) * (lat_convs) + -1 * (1 - lat_convs)
+  }
+
+  # unconverted obs have no delays (noted as NA)
+  lat_delays <- na_if(lat_delays, -1)
+  data <- bind_cols(
+    tibble(t = t),
+    as_tibble(clicks, .name_repair = ~ paste("click_", seq(K), sep = "")),
+    as_tibble(lat_convs, .name_repair = ~ paste("lat_conv_", seq(K), sep = "")),
+    as_tibble(lat_delays, .name_repair = ~ paste("lat_delay_", seq(K), sep = "")),
+  ) %>%
+    mutate(across(starts_with("lat_delay_"), ~ t + .x, .names = "mature_time_{.col}"))
+  return(data)
+}
+```
+
+
+### If the delay distriubtion is known
+
+```{r funcs_known_delay}
+
+# calculate the cumulative conversion and corrected number of clicks given an assignment history
+# up until current_t
+# corrected: if TRUE calculated the corrected number clicks using delay distribution (expo dist)
+cum_conversion_and_clicks <- function(df, K,
+                                      lambda_delay,
+                                      assignment_hist,
+                                      current_t,
+                                      corrected = TRUE) {
+  if (is.null(assignment_hist)) {
+    # If assignment history is not provided, all the conversions and clicks are used for each arm.
+    mask <- matrix(rep(TRUE, len = current_t * K), ncol = K)
+    new_df <- df %>%
+      mutate(index = row_number()) %>%
+      filter(index <= current_t)
+  } else {
+    # If assignment history is provided, only the assigned arm's conversions and clicks count.
+    mask <- sapply(seq(K), function(x) assignment_hist == x)
+    new_df <- df %>%
+      mutate(index = row_number()) %>%
+      filter(index <= length(assignment_hist))
+  }
+
+  mature_time <- new_df %>% select(starts_with("mature_time_"))
+  start_time <- replicate(K, new_df$t)
+
+  observed_clicks <- (new_df %>% select(starts_with("click_"))) * mask
+  observed_conversions <- ((mature_time < current_t) * mask) %>% replace_na(0)
+
+  cum_conversion_now <- observed_conversions %>% colSums(na.rm = T)
+  names(cum_conversion_now) <- paste("cum_conversion", seq(K), sep = "_")
+
+  cum_click_now <- observed_clicks %>% colSums()
+  names(cum_click_now) <- paste("cum_click", seq(K), sep = "_")
+
+  cum_lat_conv_now <- (new_df %>% select(starts_with("lat_conv_")) * mask) %>% colSums()
+  names(cum_lat_conv_now) <- paste("cum_lat_conv", seq(K), sep = "_")
+
+  out <- c(
+    cum_conversion_now,
+    cum_click_now,
+    cum_lat_conv_now
+  ) %>%
+    as.list() %>%
+    as_tibble()
+
+  out <- out %>%
+    bind_cols(
+      t = current_t,
+      (out %>% select(starts_with("cum_conversion")) /
+        out %>% select(starts_with("cum_click"))) %>%
+        as_tibble(.name_repair = ~ paste("cum_cvr_", seq(K), sep = "")),
+      (out %>% select(starts_with("cum_lat_conv")) /
+        out %>% select(starts_with("cum_click"))) %>%
+        as_tibble(.name_repair = ~ paste("true_cum_cvr_", seq(K), sep = ""))
+    ) %>%
+    select(t, everything())
+  if (corrected) {
+    corrected_cum_click_now <- lapply(current_t - new_df$t, function(x) pexp(x, lambda_delay)) %>%
+      do.call("rbind", args = .) %>%
+      `*`(., observed_clicks) %>%
+      colSums()
+    names(corrected_cum_click_now) <- paste("corrected_cum_click", seq(K), sep = "_")
+    out <- out %>%
+      bind_cols(
+        corrected_cum_click_now %>% bind_rows(),
+        (cum_conversion_now / corrected_cum_click_now) %>%
+          set_names(paste("corrected_cum_cvr_", seq(K), sep = "")) %>% bind_rows()
+      )
+  }
+  return(out)
+}
+
+# Plot cumulative CVR
+# batch: data is processed for every `batch` requests
+plot_cum_cvr <- function(df,
+                         lambda_delay,
+                         t_min = 1000,
+                         y_range_digit = 2,
+                         batch = 100) {
+  assignment_hist <- NULL
+  n <- nrow(df)
+  checkpoints <- batch * (seq(n %/% batch))
+
+  new_df <- lapply(checkpoints, function(current_t) {
+    cum_conversion_and_clicks(df, K, lambda_delay, assignment_hist, current_t)
+  }) %>%
+    bind_rows() %>%
+    mutate(t = checkpoints)
+
+  y_range <- new_df %>%
+    filter(t >= t_min) %>%
+    select(contains("cum_cvr")) %>%
+    asplit(1) %>%
+    unlist() %>%
+    range(na.rm = T)
+  y_range[1] <- floor(y_range[1] * 10^y_range_digit) / 10^y_range_digit
+  y_range[2] <- ceiling(y_range[2] * 10^y_range_digit) / 10^y_range_digit
+  new_df %>%
+    pivot_longer(-t,
+      names_to = c("var_name", "Group"),
+      names_pattern = "(.*)_(.*)$"
+    ) %>%
+    # filter(var_name%in%c("cum_cvr","true_cum_cvr","corrected_cum_cvr"))%>%
+    filter(var_name %in% c("cum_cvr", "corrected_cum_cvr")) %>%
+    ggplot(aes(x = t / batch, y = value, color = var_name), alpha = 0.5) +
+    geom_line() +
+    facet_wrap(. ~ Group, labeller = label_both) +
+    xlim(c(t_min / batch, NA)) +
+    ylim(y_range)
+}
+```
+
+```{r eval=FALSE, include=FALSE}
+# same delay distribution
+p_click <- c(0.6, 0.5, 0.4)
+p_c <- c(0.45, 0.4, 0.35)
+lambda_delay <- c(1 / 750, 1 / 750, 1 / 750)
+K <- 3
+
+df <- simulate_one_experiment(
+  obs = 10000, p_click = p_click,
+  p_c = p_c,
+  lambda_delay = lambda_delay
+)
+# cum_conversion_and_clicks(df,K,lambda_delay, NULL, 9000)
+# cum_conversion_and_clicks(df,lambda_delay, NULL, 5000)
+fig <- df %>% plot_cum_cvr(lambda_delay = lambda_delay, y_range_digit = 2, t_min = 2000) +
+  geom_hline(data = tibble(p_c = p_c, Group = seq(3)), aes(yintercept = p_c, color = "Ground Truth")) +
+  scale_color_manual(
+    name = "", values = c("#00b050", "red", "black"),
+    labels = c("Delay-corrected", "Naive", "Ground Truth")
+  ) +
+  labs(x = "Time", y = "CVR") +
+  theme_bw() +
+  theme(legend.position = "bottom")
+fig
+```
+
+```{r cache=T}
+# different delay distribution
+p_click <- c(0.6, 0.5, 0.4)
+p_c <- c(0.45, 0.4, 0.35)
+lambda_delay <- c(1 / 2000, 1 / 750, 1 / 500)
+K <- 3
+
+df <- simulate_one_experiment(
+  obs = 10000, p_click = p_click,
+  p_c = p_c,
+  lambda_delay = lambda_delay
+)
+# cum_conversion_and_clicks(df,K,lambda_delay, NULL, 9000)
+# cum_conversion_and_clicks(df,lambda_delay, NULL, 5000)
+fig <- df %>% plot_cum_cvr(lambda_delay = lambda_delay, y_range_digit = 2, t_min = 2000) +
+  geom_hline(data = tibble(p_c = p_c, Group = seq(3)), aes(yintercept = p_c, color = "Ground Truth")) +
+  scale_color_manual(
+    name = "", values = c("#00b050", "red", "black"),
+    labels = c("Delay-corrected", "Naive", "Ground Truth")
+  ) +
+  labs(x = "Time", y = "CVR") +
+  theme_bw() +
+  theme(legend.position = "bottom")
+fig
+ggsave("figure/cvr_comparison.png", fig, width = 6, height = 4.5)
+```
+
+### If the delay distribution is unknown
+
+```{r funcs_unknown_delay}
+
+# use EM to calculate the lambda and theta given an assignment history
+# up until current_t
+
+em_lambda_theta <- function(df, K, lambda_prior,
+                            theta_prior,
+                            assignment_hist,
+                            current_t) {
+  if (is.null(assignment_hist)) {
+    # If assignment history is not provided, all the conversions and clicks are used for each arm.
+    mask <- matrix(rep(TRUE, len = current_t * K), ncol = K)
+    new_df <- df %>%
+      mutate(index = row_number()) %>%
+      filter(index <= current_t)
+  } else {
+    # If assignment history is provided, only the assigned arm's conversions and clicks count.
+    mask <- sapply(seq(K), function(x) assignment_hist == x)
+    new_df <- df %>%
+      mutate(index = row_number()) %>%
+      filter(index <= length(assignment_hist))
+  }
+
+  mature_time <- new_df %>% select(starts_with("mature_time_"))
+  start_time <- replicate(K, new_df$t)
+
+  observed_clicks <- (new_df %>% select(starts_with("click_"))) * mask
+  observed_conversions <- ((mature_time < current_t) * mask) %>% replace_na(0)
+
+  # If no conversion, the delay time is the currently elapsed time
+  delay_time <- new_df %>%
+    select(starts_with("lat_delay_")) %>%
+    as.matrix()
+  delay_time[observed_conversions == 0] <- current_t - start_time[which(observed_conversions == 0)]
+  colnames(delay_time) <- paste("delay_time", seq(K), sep = "_")
+
+  weight <- lapply(current_t - new_df$t, function(x) ((1 - pexp(x, lambda_prior)) * theta_prior) / (1 - theta_prior + (1 - pexp(x, lambda_prior)) * theta_prior)) %>%
+    do.call("rbind", args = .)
+  weight[observed_conversions == 1] <- 1
+  weight[observed_clicks == 0] <- 0
+  colnames(delay_time) <- paste("weight", seq(K), sep = "_")
+
+  cum_conversion_now <- observed_conversions %>% colSums(na.rm = T)
+  names(cum_conversion_now) <- paste("cum_conversion", seq(K), sep = "_")
+
+  cum_click_now <- observed_clicks %>% colSums()
+  names(cum_click_now) <- paste("cum_click", seq(K), sep = "_")
+
+  cum_lat_conv_now <- (new_df %>% select(starts_with("lat_conv_")) * mask) %>% colSums()
+  names(cum_lat_conv_now) <- paste("cum_lat_conv", seq(K), sep = "_")
+
+  cum_weighted_delay_now <- (delay_time * weight) %>%
+    colSums(na.rm = T)
+  names(cum_weighted_delay_now) <- paste("cum_weighted_delay", seq(K), sep = "_")
+
+  estimated_lambda <- cum_conversion_now / cum_weighted_delay_now
+  names(estimated_lambda) <- paste("estimated_lambda", seq(K), sep = "_")
+
+  corrected_cum_click_now <- lapply(current_t - new_df$t, function(x) pexp(x, estimated_lambda)) %>%
+    do.call("rbind", args = .) %>%
+    `*`(., observed_clicks) %>%
+    colSums()
+  names(corrected_cum_click_now) <- paste("corrected_cum_click", seq(K), sep = "_")
+
+  out <- c(
+    corrected_cum_click_now,
+    cum_conversion_now,
+    cum_click_now,
+    cum_lat_conv_now,
+    estimated_lambda
+  ) %>%
+    as.list() %>%
+    as_tibble()
+
+  out <- out %>%
+    bind_cols(
+      t = current_t,
+      (out %>% select(starts_with("cum_conversion")) /
+        out %>% select(starts_with("cum_click"))) %>%
+        as_tibble(.name_repair = ~ paste("cum_cvr_", seq(K), sep = "")),
+      (out %>% select(starts_with("cum_lat_conv")) /
+        out %>% select(starts_with("cum_click"))) %>%
+        as_tibble(.name_repair = ~ paste("true_cum_cvr_", seq(K), sep = "")),
+      (out %>% select(starts_with("cum_conversion")) /
+        out %>% select(starts_with("corrected_cum_click"))) %>%
+        as_tibble(.name_repair = ~ paste("corrected_cum_cvr_", seq(K), sep = ""))
+    ) %>%
+    select(t, everything())
+  return(out)
+}
+plot_cum_cvr_em <- function(df, lambda_prior, theta_prior,
+                            t_min = 1000, y_range_digit = 2,
+                            batch = 100,
+                            cycle = 10) {
+  assignment_hist <- NULL
+  n <- nrow(df)
+  K <- length(lambda_prior)
+  checkpoints <- t_min + batch * (seq((n - t_min) %/% batch))
+
+  # First run a t_min period to collect data
+  for (j in seq(cycle)) {
+    res <- df %>% em_lambda_theta(K, lambda_prior, theta_prior, assignment_hist, t_min)
+    lambda_prior <<- res %>%
+      select(starts_with("estimated_lambda")) %>%
+      as.numeric()
+    theta_prior <<- res %>%
+      select(starts_with("corrected_cum_cvr")) %>%
+      as.numeric()
+  }
+
+  new_df <- lapply(checkpoints, function(current_t) {
+    for (j in seq(cycle)) {
+      res <- em_lambda_theta(df, K, lambda_prior, theta_prior, assignment_hist, current_t)
+      lambda_prior <<- res %>%
+        select(starts_with("estimated_lambda")) %>%
+        as.numeric()
+      theta_prior <<- res %>%
+        select(starts_with("corrected_cum_cvr")) %>%
+        as.numeric()
+    }
+    return(res)
+  }) %>%
+    bind_rows() %>%
+    mutate(t = checkpoints)
+
+  y_range <- new_df %>%
+    filter(t >= t_min) %>%
+    select(contains("cum_cvr")) %>%
+    asplit(1) %>%
+    unlist() %>%
+    range(na.rm = T)
+  y_range[1] <- floor(y_range[1] * 10^y_range_digit) / 10^y_range_digit
+  y_range[2] <- ceiling(y_range[2] * 10^y_range_digit) / 10^y_range_digit
+  new_df %>%
+    pivot_longer(-t,
+      names_to = c("var_name", "Group"),
+      names_pattern = "(.*)_(.*)$"
+    ) %>%
+    # filter(var_name%in%c("cum_cvr","true_cum_cvr","corrected_cum_cvr"))%>%
+    filter(var_name %in% c("cum_cvr", "corrected_cum_cvr")) %>%
+    ggplot(aes(x = t / batch, y = value, color = var_name), alpha = 0.5) +
+    geom_line() +
+    facet_wrap(. ~ Group, labeller = label_both) +
+    xlim(c(t_min / batch, NA)) +
+    ylim(y_range)
+}
+```
+
+```{r cache=T}
+K <- 3
+p_click <- c(1, 1, 1)
+p_c <- c(0.45, 0.4, 0.35)
+lambda_delay <- c(1 / 2000, 1 / 750, 1 / 500)
+
+df <- simulate_one_experiment(
+  obs = 10000, p_click = p_click,
+  p_c = p_c,
+  lambda_delay = lambda_delay
+)
+
+lambda_prior <- c(1 / 100, 1 / 100, 1 / 100)
+theta_prior <- c(0.2, 0.2, 0.2)
+
+# em_lambda_theta(df, K, lambda_prior, theta_prior,  NULL, 9000)
+
+fig <- df %>% plot_cum_cvr_em(
+  lambda_prior = lambda_prior,
+  theta_prior = theta_prior,
+  y_range_digit = 2,
+  batch = 500,
+  cycle = 10,
+  t_min = 2000
+) +
+  geom_hline(data = tibble(p_c = p_c, Group = seq(3)), aes(yintercept = p_c, color = "Ground Truth")) +
+  scale_color_manual(
+    name = "", values = c("#00b050", "red", "black"),
+    labels = c("Delay-corrected", "Naive", "Ground Truth")
+  ) +
+  labs(x = "Time", y = "CVR") +
+  theme_bw() +
+  theme(legend.position = "bottom")
+fig
+```
+
+
+## Integrate with Bandits
+
+```{r helper}
+soft_max <- function(vec) {
+  if (is.matrix(vec)) {
+    e_x <- exp(vec - do.call(pmax, as.data.frame(vec)))
+    return(e_x / rowSums(e_x))
+  } else {
+    e_x <- exp(vec - max(vec))
+    return(e_x / sum(e_x))
+  }
+}
+
+# Those are helper functions to calculate numerical posteriors for fully bayesian approach.
+library(mvQuad)
+
+# Normmalization trick - Works
+logsumexp <- function(x) {
+  x_max <- max(x)
+  return(x_max + log(sum(exp(x - x_max))))
+}
+
+logprior <- function(theta, lambda, alpha_t, beta_t, alpha_l, beta_l) {
+  return(log(dbeta(theta, alpha_t, beta_t)) + log(dbeta(lambda, alpha_l, beta_l)))
+}
+
+
+loglikelihood <- function(df_one_arm, current_t, theta, lambda) {
+  df_t <- df_one_arm %>% mutate(
+    delta = ifelse(is.na(mature_time_lat_delay), 0,
+      1 * (mature_time_lat_delay <= current_t)
+    )
+  )
+
+  log_prob_delta_1 <- function(theta, lambda) {
+    log_prob_delta_calc <- function(theta, lambda) {
+      return((df_t %>% filter(delta == 1) %>% nrow()) * (log(theta) + log(lambda)) -
+        lambda * (df_t %>% filter(delta == 1) %>% pluck("lat_delay") %>% sum()))
+    }
+    log_prob_delta_calc_v <- Vectorize(log_prob_delta_calc)
+    return(log_prob_delta_calc_v(theta, lambda))
+  }
+
+  log_prob_delta_0 <- function(theta, lambda) {
+    log_prob_delta_calc <- function(theta, lambda) {
+      return(sum(log(1 - theta + theta * (exp(-lambda * (current_t - df_t %>% filter(delta == 0) %>% pluck("t")))))))
+    }
+    log_prob_delta_calc_v <- Vectorize(log_prob_delta_calc)
+    return(log_prob_delta_calc_v(theta, lambda))
+  }
+  return(log_prob_delta_1(theta, lambda) + log_prob_delta_0(theta, lambda))
+}
+
+logposterior_u <- function(df_one_arm, current_t, theta, lambda, alpha_t, beta_t, alpha_l, beta_l) {
+  return(loglikelihood(df_one_arm, current_t, theta, lambda) + logprior(theta, lambda, alpha_t, beta_t, alpha_l, beta_l))
+}
+
+loglikelihood_wrap <- function(df_one_arm, current_t, par) {
+  result <- -1 * loglikelihood(df_one_arm, current_t, par[1], par[2])
+  if (is.finite(result) == F) {
+    return(1e20)
+  } else {
+    return(result)
+  }
+}
+numerical_integration <- function(log_f_vals, grid) {
+  weights <- mvQuad::getWeights(grid)
+  logsumexp(log(weights) + log_f_vals)
+}
+
+logposterior_n <- function(df_one_arm, current_t, theta, lambda, alpha_t, beta_t, alpha_l, beta_l, z) {
+  return(loglikelihood(df_one_arm, current_t, theta, lambda) + logprior(theta, lambda, alpha_t, beta_t, alpha_l, beta_l) - z)
+}
+
+logposterior_n_mean_theta <- function(df_one_arm, current_t, theta, lambda, alpha_t, beta_t, alpha_l, beta_l, z) {
+  return(log(theta) + loglikelihood(df_one_arm, current_t, theta, lambda) + logprior(theta, lambda, alpha_t, beta_t, alpha_l, beta_l) - z)
+}
+
+logposterior_n_mean_lambda <- function(df_one_arm, current_t, theta, lambda, alpha_t, beta_t, alpha_l, beta_l, z) {
+  return(log(lambda) + loglikelihood(df_one_arm, current_t, theta, lambda) + logprior(theta, lambda, alpha_t, beta_t, alpha_l, beta_l) - z)
+}
+
+logposterior_n_quantile <- function(df_one_arm, current_t, alpha_t, beta_t, alpha_l, beta_l, z, q_list, prec = 100) {
+  theta_lambda_grid <- createNIGrid(dim = 2, type = c("GLe", "GLe"), level = prec)
+  weights <- mvQuad::getWeights(theta_lambda_grid)
+  nodes <- mvQuad::getNodes(theta_lambda_grid)
+
+  new_q <- unique(q_list)
+
+  ord <- order(new_q)
+  sorted_q <- new_q[ord] # same as sort()
+  # do stuff, then revert
+  # q_list == sorted_q[order(ord)]
+
+  f_val <- logposterior_n(df_one_arm, current_t, nodes[, 2], nodes[, 1], alpha_t, beta_t, alpha_l, beta_l, z)
+  pos_out <- NULL
+  cursor <- 1
+  for (i in 1:(prec)) {
+    int_val <- logsumexp(log(weights[1:(i * prec)]) + f_val[1:(i * prec)])
+    if (exp(int_val) > sorted_q[cursor]) {
+      pos_out[cursor] <- i
+      cursor <- cursor + 1
+      if (cursor > length(sorted_q)) {
+        break
+      }
+    }
+  }
+  pos_out <- pos_out[order(ord)] %>% replace_na(prec)
+
+  quantile_out <- sapply(seq_along(new_q), function(i) {
+    q <- new_q[i]
+    pos <- pos_out[i]
+    if (abs(q - exp(logsumexp(log(weights[1:(pos * prec)]) + f_val[1:(pos * prec)]))) < abs(q - exp(logsumexp(log(weights[1:(pos * prec - prec)]) + f_val[1:(pos * prec - prec)])))) {
+      i_closest <- pos
+    } else {
+      i_closest <- max(1, pos - 1)
+    }
+    return(nodes[i_closest, ][1])
+  })
+  names(quantile_out) <- new_q
+  return(quantile_out[as.character(q_list)])
+}
+```
+
+
+```{r bandits}
+# random agent
+random_bandit <- function(df, K, batch_size = 100, init = FALSE) {
+  sampling_prob <- rep(1 / K, K)
+  out <- rmultinom(batch_size, 1, sampling_prob) %>%
+    t() %>%
+    max.col()
+  return(out)
+}
+
+# naive thompson sampler
+naive_ts_bandit <- function(df, K, batch_size = 100, init = FALSE) {
+  if (init) {
+    alphas <- rep(1, K)
+    betas <- rep(1, K)
+  } else {
+    alphas <- (df %>% select(starts_with("cum_conversion")) + 1) %>% as.numeric()
+    betas <- (df %>% select(starts_with("cum_click")) -
+      df %>% select(starts_with("cum_conversion")) + 1) %>% as.numeric()
+  }
+  thetas <- rbeta(K * batch_size, alphas, betas) %>%
+    matrix(nrow = batch_size, byrow = TRUE)
+  return(max.col(thetas))
+}
+
+# delay corrected thompson sampler
+corrected_ts_bandit <- function(df, K, batch_size = 100, init = FALSE) {
+  if (init) {
+    alphas <- rep(1, K)
+    betas <- rep(1, K)
+  } else {
+    alphas <- (df %>% select(starts_with("cum_conversion")) + 1) %>% as.numeric()
+    betas <- (df %>% select(starts_with("corrected_cum_click")) -
+      df %>% select(starts_with("cum_conversion")) + 1) %>%
+      as.numeric() %>%
+      pmax(1, .)
+  }
+  thetas <- rbeta(K * batch_size, alphas, betas) %>%
+    matrix(nrow = batch_size, byrow = TRUE)
+  return(max.col(thetas))
+}
+
+# delayed UCB
+ucb_bandit <- function(df, K, batch_size = 100, init = FALSE,
+                       epsilon = 0.1, probablistic = TRUE) {
+  if (init) {
+    sampling_prob <- rep(1 / K, K)
+    out <- rmultinom(batch_size, 1, sampling_prob) %>%
+      t() %>%
+      max.col()
+    return(out)
+  }
+  t <- df$t
+  N_conversion <- df %>% select(starts_with("cum_conversion"))
+  N_clicks <- df %>% select(starts_with("cum_click"))
+  corrected_N_clicks <- df %>% select(starts_with("corrected_cum_click"))
+  beta_epsilon <- (1 + epsilon) * log(t)
+  ucb <- N_conversion / corrected_N_clicks + sqrt(N_clicks / corrected_N_clicks) * sqrt(beta_epsilon / 2 / corrected_N_clicks)
+  ucb <- ucb %>%
+    as_tibble() %>%
+    mutate(across(everything(), ~ replace_na(.x, Inf)))
+  if (probablistic) {
+    psuedo_var <- (ucb - N_conversion / corrected_N_clicks) / corrected_N_clicks
+    multiplier <- 1 / sum(psuedo_var)
+    sampling_prob <- soft_max(multiplier * ucb)
+    out <- rmultinom(batch_size, 1, sampling_prob) %>%
+      t() %>%
+      max.col()
+    return(out)
+  }
+  return(rep(which.max(ucb) %>% as.numeric(), batch_size))
+}
+
+# bayesian UCB agent, use quantile from posterior as upper bound
+bucb_bandit <- function(df, K, batch_size = 100, init = FALSE,
+                        quantile_q = 0.9, probablistic = TRUE) {
+  if (init) {
+    alphas <- rep(1, K)
+    betas <- rep(1, K)
+  } else {
+    alphas <- (df %>% select(starts_with("cum_conversion")) + 1) %>% as.numeric()
+    betas <- (df %>% select(starts_with("corrected_cum_click")) -
+      df %>% select(starts_with("cum_conversion")) + 1) %>%
+      as.numeric() %>%
+      pmax(1, .)
+  }
+  thetas_quant <- qbeta(quantile_q, alphas, betas)
+  if (probablistic) {
+    # posterior_var = alphas*betas/((alphas+betas)^2*(alphas+betas+1))
+    psuedo_var <- (qbeta(0.9, alphas, betas) - qbeta(0.1, alphas, betas)) / (alphas + betas)
+    multiplier <- 1 / sum(psuedo_var)
+    sampling_prob <- soft_max(multiplier * thetas_quant)
+    out <- rmultinom(batch_size, 1, sampling_prob) %>%
+      t() %>%
+      max.col()
+    return(out)
+  }
+  return(rep(which.max(thetas_quant), batch_size))
+}
+
+fully_bayesian <- function(df, K, current_t,
+                           batch_size = 100, init = FALSE,
+                           alpha_t = 1, beta_t = 1, alpha_l = 1, beta_l = 1,
+                           quantile_q = 0.5,
+                           grid_level = 50,
+                           probablistic = TRUE) {
+  if (init) {
+    sampling_prob <- rep(1 / K, K)
+    out <- rmultinom(batch_size, 1, sampling_prob) %>%
+      t() %>%
+      max.col()
+    return(out)
+  }
+  myGrid <- createNIGrid(dim = 2, type = c("GLe", "GLe"), level = grid_level)
+  nn <- mvQuad::getNodes(myGrid)
+
+  process_one_arm <- function(arm_num) {
+    df_one_arm <- df %>%
+      select(t, ends_with(as.character(arm_num))) %>%
+      rename_with(~ str_replace(.x, "_([:digit:]+)$", "")) %>%
+      filter(click == 1, t <= current_t)
+
+    pp <- logposterior_u(
+      theta = nn[, 1], lambda = nn[, 2], current_t = current_t,
+      df_one_arm = df_one_arm,
+      alpha_t = alpha_t,
+      beta_t = beta_t,
+      alpha_l = alpha_l,
+      beta_l = beta_l
+    )
+    z <- numerical_integration(pp, myGrid)
+    quant_value <- logposterior_n_quantile(df_one_arm, current_t, alpha_t, beta_t, alpha_l, beta_l, z, c(0.1, quantile_q, 0.9), prec = grid_level)
+    names(quant_value) <- c("quant_lb", "ucb", "quant_ub")
+    return(quant_value)
+  }
+
+  res <- lapply(seq(K), process_one_arm) %>% bind_rows()
+
+  if (probablistic) {
+    N_clicks <- df %>%
+      summarise(across(starts_with("click"), sum)) %>%
+      as.numeric()
+    res <- res %>% mutate(psuedo_var = (quant_ub - quant_lb) / N_clicks)
+    multiplier <- 1 / sum(res$psuedo_var)
+    sampling_prob <- soft_max(multiplier * res$ucb)
+    out <- rmultinom(batch_size, 1, sampling_prob) %>%
+      t() %>%
+      max.col()
+    return(out)
+  }
+  return(rep(which.max(res$ucb) %>% as.numeric(), batch_size))
+}
+
+
+bandit_algo_wrapper <- function(bandit_algo,
+                                bandit_hist_info,
+                                current_t,
+                                batch_size,
+                                df,
+                                K,
+                                corrected = TRUE,
+                                unknown_delay = FALSE,
+                                fully_bayesian_method = FALSE,
+                                cycle = 10) {
+  # stopifnot(length(bandit_hist_info$assignment_hist)==current_t)
+  if (fully_bayesian_method == TRUE) {
+    mask <- sapply(seq(K), function(x) (bandit_hist_info$assignment_hist == x) * 1)
+    temp_df <- df %>% filter(row_number() <= length(bandit_hist_info$assignment_hist))
+    temp_df <- temp_df %>%
+      select(-starts_with("click_")) %>%
+      bind_cols(temp_df %>% select(starts_with("click")) %>% `*`(., mask))
+    assignment <- c(bandit_hist_info$assignment_hist, bandit_algo(
+      temp_df, K, current_t,
+      batch_size
+    ))
+    return(list(assignment_hist = assignment))
+  }
+
+  if (unknown_delay == FALSE) {
+    res_df <- cum_conversion_and_clicks(df, K, bandit_hist_info$lambda_delay,
+      bandit_hist_info$assignment_hist,
+      current_t,
+      corrected = corrected
+    )
+    assignment <- c(bandit_hist_info$assignment_hist, bandit_algo(res_df, K, batch_size))
+
+    if (corrected) {
+      return(list(
+        assignment_hist = assignment,
+        lambda_delay = bandit_hist_info$lambda_delay
+      ))
+    }
+    return(list(assignment_hist = assignment))
+  } else {
+    # lambda_prior = bandit_hist_info$lambda_prior
+    # theta_prior = bandit_hist_info$theta_prior
+    for (j in seq(cycle)) {
+      res_df <- em_lambda_theta(
+        df, K, bandit_hist_info$lambda_prior,
+        bandit_hist_info$theta_prior,
+        bandit_hist_info$assignment_hist,
+        current_t
+      )
+      bandit_hist_info$lambda_prior <- res_df %>%
+        select(starts_with("estimated_lambda")) %>%
+        as.numeric()
+      bandit_hist_info$theta_prior <- res_df %>%
+        select(starts_with("corrected_cum_cvr")) %>%
+        as.numeric()
+    }
+    assignment <- c(bandit_hist_info$assignment_hist, bandit_algo(res_df, K, batch_size))
+    return(list(
+      assignment_hist = assignment,
+      lambda_prior = bandit_hist_info$lambda_prior,
+      theta_prior = bandit_hist_info$theta_prior
+    ))
+  }
+}
+
+K <- 3
+lambda_delay <- c(1 / 500, 1 / 500, 1 / 500)
+df <- simulate_one_experiment(
+  obs = 10000, p_click = c(0.5, 0.6, 0.4),
+  p_c = c(0.01, 0.012, 0.02),
+  lambda_delay = lambda_delay
+)
+res_df <- df %>% cum_conversion_and_clicks(K, lambda_delay, NULL, 100)
+# res_df%>%random_bandit(3)
+# res_df%>%naive_ts_bandit(3)
+# res_df%>%corrected_ts_bandit(3)
+# res_df%>%bucb_bandit(3)
+# res_df%>%bucb_bandit(3, probablistic = F)
+# res_df%>%ucb_bandit(3)
+# res_df%>%ucb_bandit(3, probablistic =F)
+# df%>%fully_bayesian(3, 100, init=FALSE)
+# df%>%fully_bayesian(3, 100, probablistic=F)
+```
+
+```{r compute_speed_comparison, eval=FALSE, echo=TRUE}
+# install.packages('microbenchmark')
+library(microbenchmark)
+K <- 3
+lambda_delay <- c(1 / 500, 1 / 500, 1 / 500)
+df <- simulate_one_experiment(
+  obs = 10000, p_click = c(0.5, 0.6, 0.4),
+  p_c = c(0.01, 0.012, 0.02),
+  lambda_delay = lambda_delay
+)
+
+lambda_prior <- c(0.01, 0.01, 0.01)
+theta_prior <- c(0.2, 0.2, 0.2)
+
+bandit_hist_info <- list(
+  lambda_delay = lambda_delay,
+  lambda_prior = lambda_prior,
+  theta_prior = theta_prior
+)
+current_t <- 2000
+batch_size <- 500
+
+
+benchmark_result <- microbenchmark(
+  random =
+    bandit_algo_wrapper(
+      random_bandit,
+      bandit_hist_info,
+      current_t,
+      batch_size,
+      df, K,
+      corrected = FALSE
+    ),
+  naive_ts =
+    bandit_algo_wrapper(
+      naive_ts_bandit,
+      bandit_hist_info,
+      current_t,
+      batch_size,
+      df, K,
+      corrected = FALSE
+    ),
+  delay_corrected_ucb =
+    bandit_algo_wrapper(
+      ucb_bandit,
+      bandit_hist_info,
+      current_t,
+      batch_size,
+      df, K,
+      unknown_delay = TRUE,
+      cycle = 10
+    ),
+  fully_bayesian =
+    bandit_algo_wrapper(
+      fully_bayesian,
+      bandit_hist_info,
+      current_t,
+      batch_size,
+      df, K,
+      fully_bayesian_method = TRUE,
+      cycle = 10
+    ),
+  delay_corrected_ts =
+    bandit_algo_wrapper(
+      corrected_ts_bandit,
+      bandit_hist_info,
+      current_t,
+      batch_size,
+      df, K,
+      unknown_delay = TRUE,
+      cycle = 10
+    ),
+  times = 50
+)
+benchmark_result_df <- print(benchmark_result)
+# benchmark_result_df%>%select(expr, min, mean, median,max)%>%
+#   mutate(Algorithm = factor(expr, levels = c("random",
+#                                              "naive_ts",
+#                                              "delay_corrected_ucb",
+#                                              "fully_bayesian",
+#                                              "delay_corrected_ts"),
+#                             labels = c("Random",
+#                                        "Naive TS",
+#                                        "D-UCB",
+#                                        "Fully Bayesian",
+#                                        "D-TS")),
+#          across( c(min, mean, median,max), ~round(.x/1000,3)))%>%
+#   select(Algorithm, everything(),-expr)%>%
+#   kbl(format="latex",booktabs = T) %>%
+#   kable_classic(full_width = F)
+```
+
+```{r get_regrets_func}
+get_regrets <- function(df, p_c,
+                        bandit_init_info = list(
+                          lambda_delay = NULL,
+                          lambda_prior = NULL,
+                          theta_prior = NULL
+                        ),
+                        bandit_algo_list = c(
+                          "random_choices" =
+                            partial(bandit_algo_wrapper,
+                              bandit_algo = random_bandit,
+                              corrected = FALSE
+                            ),
+                          "naive_ts_choices" =
+                            partial(bandit_algo_wrapper,
+                              bandit_algo = naive_ts_bandit,
+                              corrected = FALSE
+                            ),
+                          "corrected_ts_choices" =
+                            partial(bandit_algo_wrapper,
+                              bandit_algo = corrected_ts_bandit
+                            ),
+                          "estimated_corrected_ts_choices" =
+                            partial(bandit_algo_wrapper,
+                              bandit_algo = corrected_ts_bandit,
+                              unknown_delay = TRUE,
+                              cycle = 10
+                            ),
+                          "ucb_choices" =
+                            partial(bandit_algo_wrapper,
+                              bandit_algo = ucb_bandit
+                            ),
+                          "estimated_ucb_choices" =
+                            partial(bandit_algo_wrapper,
+                              bandit_algo = ucb_bandit,
+                              unknown_delay = TRUE,
+                              cycle = 10
+                            ),
+                          "fully_bayesian_choices" =
+                            partial(bandit_algo_wrapper,
+                              bandit_algo = fully_bayesian,
+                              fully_bayesian_method = TRUE,
+                              cycle = 10
+                            )
+                        ),
+                        batch_size = 100,
+                        t_min = 2000) {
+  func_env <- environment()
+  K <- length(p_c)
+  n <- nrow(df)
+
+  checkpoints <- t_min + batch_size * (seq((n - t_min) %/% batch_size))
+  checkpoints <- c(checkpoints, n)
+  dup_times <- c(checkpoints - c(0, checkpoints[-length(checkpoints)]))
+  if ((n - t_min) %% batch_size == 0) {
+    dup_times <- dup_times[-length(dup_times)]
+  }
+  get_assignment <- function(bandit_algo, bandit_hist_info,
+                             current_t,
+                             batch_size, df, K) {
+    res <- bandit_algo(bandit_hist_info, current_t, batch_size, df, K)
+    res$winning_prob <- res$assignment %>%
+      factor(levels = seq(K)) %>%
+      table() %>%
+      `/`(., sum(.)) %>%
+      as.numeric()
+    return(res)
+  }
+  get_assignmentV <- Vectorize(get_assignment,
+    vectorize.args = c("bandit_algo", "bandit_hist_info"),
+    SIMPLIFY = FALSE
+  )
+  bandit_init_info$assignment_hist <- random_bandit(NA, K, dup_times[1], init = TRUE)
+  bandit_hist_info_list <- replicate(length(bandit_algo_list), bandit_init_info, simplify = FALSE) %>%
+    set_names(names(bandit_algo_list))
+
+  track_est <- any(names(bandit_algo_list) %>% str_detect("estimated"))
+
+  if (track_est) {
+    estimator_names <- c(paste("lambda_est_", seq(K), sep = ""), paste("theta_est_", seq(K), sep = ""))
+    index_first_est_algo <- which(names(bandit_algo_list) %>% str_detect("estimated"))[1]
+
+    track_estimation <- c(
+      bandit_hist_info_list[[index_first_est_algo]]$lambda_prior,
+      bandit_hist_info_list[[index_first_est_algo]]$theta_prior
+    ) %>%
+      set_names(estimator_names) %>%
+      bind_rows() %>%
+      mutate(current_t = df$t[1])
+  }
+
+  track_est_res <- lapply(seq(2, length(dup_times)), function(i) {
+    batch_size <- dup_times[i]
+    current_t <- df$t[length(bandit_hist_info_list[[1]]$assignment_hist)]
+    assign("bandit_hist_info_list",
+      get_assignmentV(bandit_algo_list, bandit_hist_info_list, current_t, batch_size, df, K),
+      envir = func_env
+    )
+    if (track_est) {
+      est_res <- c(
+        bandit_hist_info_list[[index_first_est_algo]]$lambda_prior,
+        bandit_hist_info_list[[index_first_est_algo]]$theta_prior
+      ) %>%
+        set_names(estimator_names) %>%
+        bind_rows() %>%
+        mutate(current_t = {{ current_t }})
+      winprob <- lapply(bandit_hist_info_list, function(x) {
+        (x$winning_prob) %>%
+          set_names(seq(K)) %>%
+          bind_rows()
+      }) %>%
+        bind_rows(.id = "algo_name") %>%
+        pivot_wider(
+          names_from = algo_name,
+          names_glue = "{algo_name}_winprob_{.value}",
+          values_from = -algo_name
+        )
+      return(bind_cols(est_res, winprob))
+    }
+  })
+  regret_df <-
+    lapply(bandit_hist_info_list, function(x) {
+      x$assignment_hist
+    }) %>%
+    as_tibble() %>%
+    mutate(
+      t = df$t,
+      index = row_number(),
+      across(ends_with("choices"), ~ max(p_c) - p_c[.x], .names = "{.col}_loss")
+    ) %>%
+    mutate(across(ends_with("loss"), cumsum, .names = "cum_{.col}"))
+  if (track_est) {
+    track_estimation <- track_estimation %>% bind_rows(track_est_res)
+    regret_df <- regret_df %>% left_join(track_estimation, by = c("t" = "current_t"))
+  }
+  return(regret_df)
+}
+```
+
+```{r get_criteo_data, cache=T}
+header <- c("click_timestamp", "conversion_timestamp")
+df_criteo <- read_tsv("../data/criteo_conversion_logs/data_no_feature.txt",
+  col_names = header,
+  col_types = "nn"
+)
+
+df_criteo <- df_criteo %>% mutate(lat_delay = conversion_timestamp - click_timestamp)
+
+get_synthetics_data <- function(df_criteo, sample_size, p_c = c(0.5, 0.4, 0.3),
+                                lambda_delay = c(1 / 1000, 1 / 750, 1 / 500)) {
+  K <- length(p_c)
+  sampled_orders <- df_criteo %>%
+    select(lat_delay) %>%
+    sample_n(sample_size)
+  sampled_start_time <- df_criteo %>%
+    select(t = click_timestamp) %>%
+    sample_n(sample_size) %>%
+    arrange(t)
+
+  # adjust cvr according to model (p_c, lambda_delay)
+  cvr_adjust <- p_c / max(p_c)
+  cvr_keep_flag <- rbinom(sample_size * K, 1, cvr_adjust) %>%
+    matrix(ncol = K, byrow = TRUE)
+  cvr_keep_flag[cvr_keep_flag == 0] <- NA
+  user_orders <- apply(cvr_keep_flag, 2, function(x) x * sampled_orders) %>%
+    bind_cols(.name_repair = ~ paste("lat_delay", seq(K), sep = "_"))
+  # adjust delays according to model
+  delay_adjust <- (1 / lambda_delay) / min((1 / lambda_delay))
+  user_orders <- t(t(user_orders) * delay_adjust)
+  clicks <- matrix(1, nrow = sample_size, ncol = K)
+  colnames(clicks) <- paste("click", seq(K), sep = "_")
+  lat_convs <- !is.na(user_orders)
+  colnames(lat_convs) <- paste("lat_conv", seq(K), sep = "_")
+  mature_time_lat_delay <-
+    out <- sampled_start_time %>%
+    bind_cols(
+      clicks %>% as_tibble(),
+      lat_convs %>% as_tibble(),
+      user_orders %>% as_tibble()
+    ) %>%
+    mutate(across(starts_with("lat_delay_"), ~ t + .x, .names = "mature_time_{.col}"))
+
+  return(out)
+}
+```
+
+```{r}
+# helper function run repeated simulation in parallel
+repeat_simulation <-
+  function(n_sim, p_click, p_c,
+           lambda_delay,
+           bandit_init_info,
+           obs_each = 10000,
+           seed = 1234,
+           batch_size = 500,
+           bandit_algo_list = c(
+             "random_choices" =
+               partial(bandit_algo_wrapper,
+                 bandit_algo = random_bandit,
+                 corrected = FALSE
+               ),
+             "naive_ts_choices" =
+               partial(bandit_algo_wrapper,
+                 bandit_algo = naive_ts_bandit,
+                 corrected = FALSE
+               ),
+             "corrected_ts_choices" =
+               partial(bandit_algo_wrapper,
+                 bandit_algo = corrected_ts_bandit
+               ),
+             "estimated_corrected_ts_choices" =
+               partial(bandit_algo_wrapper,
+                 bandit_algo = corrected_ts_bandit,
+                 unknown_delay = TRUE,
+                 cycle = 10
+               ),
+             "ucb_choices" =
+               partial(bandit_algo_wrapper,
+                 bandit_algo = ucb_bandit
+               ),
+             "estimated_ucb_choices" =
+               partial(bandit_algo_wrapper,
+                 bandit_algo = ucb_bandit,
+                 unknown_delay = TRUE,
+                 cycle = 10
+               )
+           ),
+           t_min = 2000,
+           weibull = F,
+           synthetic_data = F,
+           num_core = detectCores() - 2, debug = FALSE, ...) {
+    set.seed(seed)
+
+    #### Run Parallelly ####
+    cl <- makeCluster(num_core) # define the clusters
+    clusterExport(cl, c(
+      "get_regrets", "simulate_one_experiment",
+      "soft_max",
+      "cum_conversion_and_clicks",
+      "naive_ts_bandit", "random_bandit",
+      "corrected_ts_bandit", "bucb_bandit",
+      "ucb_bandit",
+      "fully_bayesian",
+      "loglikelihood",
+      "loglikelihood_wrap",
+      "logposterior_n",
+      "logposterior_n_mean_lambda",
+      "logposterior_n_mean_theta",
+      "logposterior_n_quantile",
+      "logposterior_u",
+      "logprior",
+      "logsumexp",
+      "numerical_integration",
+      "bandit_algo_wrapper",
+      "em_lambda_theta",
+      "df_criteo",
+      "get_synthetics_data"
+    ))
+    registerDoSNOW(cl)
+    # print out the progress for every iteration
+    pb <- txtProgressBar(max = n_sim, style = 3)
+    progress <- function(n) setTxtProgressBar(pb, n)
+    opts <- list(progress = progress)
+
+    start.time <- proc.time() # calculate the execution time
+    if (!debug) {
+      .combine <- bind_rows
+    } else {
+      .combine <- c
+    }
+    output_par <-
+      foreach(
+        i = 1:n_sim, .combine = .combine,
+        .export = c(
+          "get_regrets", "simulate_one_experiment",
+          "soft_max",
+          "cum_conversion_and_clicks",
+          "naive_ts_bandit", "random_bandit",
+          "corrected_ts_bandit", "bucb_bandit",
+          "ucb_bandit",
+          "fully_bayesian",
+          "loglikelihood",
+          "loglikelihood_wrap",
+          "logposterior_n",
+          "logposterior_n_mean_lambda",
+          "logposterior_n_mean_theta",
+          "logposterior_n_quantile",
+          "logposterior_u",
+          "logprior",
+          "logsumexp",
+          "numerical_integration",
+          "bandit_algo_wrapper",
+          "em_lambda_theta",
+          "df_criteo",
+          "get_synthetics_data"
+        ),
+        .options.snow = opts, .errorhandling = "pass", .verbose = debug
+      ) %dopar%
+      # the default .combine = list
+      {
+        library(tidyverse)
+        library(mvQuad)
+        if (synthetic_data) {
+          res <- get_synthetics_data(
+            df_criteo, obs_each, p_c,
+            lambda_delay
+          )
+          p_c <- res %>%
+            summarise(across(starts_with("lat_conv"), mean)) %>%
+            as.numeric()
+        } else {
+          res <- simulate_one_experiment(
+            obs = obs_each,
+            p_click = p_click,
+            p_c = p_c,
+            lambda_delay = lambda_delay,
+            weibull = weibull
+          )
+        }
+        out <- res %>%
+          get_regrets(
+            p_c = p_c,
+            bandit_init_info = bandit_init_info,
+            bandit_algo_list = bandit_algo_list,
+            batch_size = batch_size,
+            t_min = t_min
+          ) %>%
+          mutate(sim_id = i)
+        return(out)
+      }
+    stopCluster(cl) # stop the cluster in the end
+    (end.time <- proc.time() - start.time) # total execution time
+    print(end.time)
+    return(output_par)
+  }
+
+plot_regret_graph <- function(sim_df, y_range_digit = 1, t_min = 100,
+                              facet = TRUE,
+                              log_scale = TRUE) {
+  plot_df <- sim_df %>%
+    filter(index >= t_min) %>%
+    select(index, matches("cum_.*_loss")) %>%
+    group_by(index) %>%
+    summarise(
+      across(matches("^cum_.*_loss"), mean, .names = "mean_{.col}"),
+      across(matches("^cum_.*_loss"), median, .names = "median_{.col}"),
+      across(matches("^cum_.*_loss"), ~ quantile(probs = 0.1, .x), .names = "lb80_{.col}"),
+      across(matches("^cum_.*_loss"), ~ quantile(probs = 0.9, .x), .names = "ub80_{.col}")
+    )
+  y_ub <- plot_df %>%
+    select(starts_with("ub80"), -contains("random_choices")) %>%
+    summarise_all(max) %>%
+    max(na.rm = T)
+  y_ub <- ceiling(y_ub / 10^y_range_digit) * 10^y_range_digit
+  pinned_points <- floor(10^(seq(log10(t_min), log10(max(plot_df$index)), length.out = 10)))
+
+  plot_df <- plot_df %>%
+    pivot_longer(-index,
+      names_to = c(".value", "method"),
+      names_pattern = "(.*)_cum_(.*)_choices_loss$"
+    ) %>%
+    mutate(method = factor(method,
+      levels = c(
+        "random",
+        "naive_ts",
+        "bucb",
+        "ucb",
+        "corrected_ts",
+        "estimated_bucb",
+        "estimated_ucb",
+        "fully_bayesian",
+        "estimated_corrected_ts"
+      ),
+      labels = c(
+        "Random", "Naive TS",
+        "Known Dist D-BUCB",
+        "Known Dist D-UCB",
+        "Known Dist D-TS",
+        "D-BUCB",
+        "D-UCB", "Full Bayesian", "D-TS"
+      )
+    ))
+  fig <- plot_df %>%
+    ggplot(aes(x = index, y = mean, ymin = lb80, ymax = ub80, color = method, fill = method)) +
+    geom_ribbon(color = NA, alpha = 0.2) +
+    geom_point(
+      data = plot_df %>% filter(index %in% pinned_points),
+      aes(shape = method), size = 2
+    ) +
+    geom_line(alpha = 1, size = 1.1) +
+    ylim(c(NA, y_ub))
+  guides(color = guide_legend(override.aes = list(fill = NA)))
+  if (log_scale) {
+    fig <- fig +
+      scale_x_log10(breaks = 10^(seq(0, 5)), labels = trans_format("log10", math_format(10^.x)))
+  }
+  if (facet) {
+    fig <- fig + facet_wrap(. ~ method, nrow = 2)
+  }
+  return(fig + theme_bw(base_size = 17))
+}
+
+plot_estimated_graph <- function(sim_df,
+                                 log_scale = FALSE) {
+  plot_df <- sim_df %>%
+    filter(!is.na(theta_est_1)) %>%
+    select(index, matches("^(theta|lambda)_est_.*")) %>%
+    group_by(index) %>%
+    summarise(
+      across(matches("^(theta|lambda)_est_.*"), mean, .names = "mean_{.col}"),
+      across(matches("^(theta|lambda)_est_.*"), median, .names = "median_{.col}"),
+      across(matches("^(theta|lambda)_est_.*"), ~ quantile(probs = 0.1, .x), .names = "lb80_{.col}"),
+      across(matches("^(theta|lambda)_est_.*"), ~ quantile(probs = 0.9, .x), .names = "ub80_{.col}")
+    )
+  plot_df <- plot_df %>%
+    pivot_longer(-index,
+      names_to = c(".value", "est_name", "Group"),
+      names_pattern = "(.*)_(theta|lambda)_est_(.*)$"
+    ) %>%
+    mutate(
+      method = factor(est_name,
+        levels = c(
+          "theta",
+          "lambda"
+        ),
+        labels = ""
+      ),
+      Group = factor(Group)
+    )
+  fig <- plot_df %>%
+    ggplot(aes(
+      x = index, y = mean, ymin = lb80, ymax = ub80, color = Group, fill = Group,
+      shape = Group
+    )) +
+    geom_ribbon(color = NA, alpha = 0.1) +
+    # geom_point(data=plot_df%>%filter(index %in% pinned_points),size=2)+
+    geom_line(alpha = 1) +
+    facet_wrap(. ~ est_name, ncol = 2, scales = "free_y") +
+    guides(color = guide_legend(override.aes = list(fill = NA)))
+  if (log_scale) {
+    fig <- fig + scale_x_continuous(trans = "log10")
+  }
+  return(fig)
+}
+```
+
+```{r prepare_for_simulation, cache=T}
+bandit_algo_list <- c(
+  "random_choices" =
+    partial(bandit_algo_wrapper,
+      bandit_algo = random_bandit,
+      corrected = FALSE
+    ),
+  "naive_ts_choices" =
+    partial(bandit_algo_wrapper,
+      bandit_algo = naive_ts_bandit,
+      corrected = FALSE
+    ),
+  "estimated_corrected_ts_choices" =
+    partial(bandit_algo_wrapper,
+      bandit_algo = corrected_ts_bandit,
+      unknown_delay = TRUE,
+      cycle = 10
+    ),
+  "estimated_ucb_choices" =
+    partial(bandit_algo_wrapper,
+      bandit_algo = ucb_bandit,
+      unknown_delay = TRUE,
+      cycle = 10
+    )
+)
+
+
+
+lambda_prior <- c(0.01, 0.01, 0.01)
+theta_prior <- c(0.2, 0.2, 0.2)
+
+bandit_init_info <- list(
+  lambda_delay = lambda_delay,
+  lambda_prior = lambda_prior,
+  theta_prior = theta_prior
+)
+```
+
+```{r high_CVR, cache=T, message=FALSE}
+# p_click=c(0.6, 0.5, 0.4)
+p_click <- c(1, 1, 1)
+p_c <- c(0.5, 0.4, 0.3)
+lambda_delay <- c(1 / 1000, 1 / 750, 1 / 500)
+batch_size <- 500
+
+obs_each <- 10000
+t_min <- 100
+
+N_sim <- 50
+sim_df3 <- repeat_simulation(N_sim, p_click, p_c,
+  lambda_delay = lambda_delay,
+  bandit_algo_list = bandit_algo_list,
+  bandit_init_info = bandit_init_info,
+  batch_size = batch_size,
+  obs_each = obs_each,
+  t_min = t_min
+)
+```
+
+
+```{r}
+fig3 <- sim_df3 %>% plot_regret_graph(facet = FALSE, t_min = t_min) +
+  guides(
+    x = guide_prism_minor(),
+    y = guide_prism_minor()
+  ) +
+  theme(
+    legend.position = c(0.3, 0.7), legend.title = element_blank(),
+    legend.background = element_rect(fill = NA, color = NA),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  ) +
+  labs(
+    y = "Regret",
+    x = "Round t"
+  )
+
+fig3
+ggsave("figure/high_cvr_bandit_comparison.png", fig3, width = 4, height = 3)
+```
+
+```{r}
+sim_df3 %>% plot_estimated_graph()
+```
+
+```{r cache=T, message=FALSE}
+bandit_algo_list_w_bayesian <- c(bandit_algo_list,
+  "fully_bayesian_choices" =
+    partial(bandit_algo_wrapper,
+      bandit_algo = fully_bayesian,
+      fully_bayesian_method = TRUE,
+      cycle = 10
+    )
+)
+
+sim_df3_bayesian <- repeat_simulation(N_sim, p_click, p_c,
+  lambda_delay = lambda_delay,
+  bandit_algo_list = bandit_algo_list_w_bayesian,
+  bandit_init_info = bandit_init_info,
+  batch_size = batch_size,
+  obs_each = obs_each,
+  t_min = t_min
+)
+sim_df3_bayesian %>% write_rds("figure/high_cvr_bandit_comparison_with_bayesian.rds")
+```
+
+```{r}
+fig3_bayesian <- sim_df3_bayesian %>% plot_regret_graph(facet = FALSE, t_min = t_min) +
+  guides(
+    x = guide_prism_minor(),
+    y = guide_prism_minor()
+  ) +
+  theme(
+    legend.position = c(0.3, 0.7), legend.title = element_blank(),
+    legend.background = element_rect(fill = NA, color = NA),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  ) +
+  labs(
+    y = "Regret",
+    x = "Round t"
+  )
+
+fig3_bayesian
+
+ggsave("figure/high_cvr_bandit_comparison_with_bayesian.png", fig3_bayesian, width = 4, height = 3)
+```
+
+```{r low_cvr, cache=T, message=FALSE}
+# Low cvr
+# p_click=c(0.6, 0.5, 0.4)
+p_click <- c(1, 1, 1)
+p_c <- c(0.1, 0.05, 0.03)
+lambda_delay <- c(1 / 1000, 1 / 750, 1 / 500)
+batch_size <- 500
+
+obs_each <- 10000
+t_min <- 100
+
+N_sim <- 50
+
+bandit_init_info <- list(
+  lambda_delay = lambda_delay,
+  lambda_prior = lambda_prior,
+  theta_prior = theta_prior
+)
+
+
+sim_df4 <- repeat_simulation(N_sim, p_click, p_c,
+  lambda_delay = lambda_delay,
+  bandit_algo_list = bandit_algo_list,
+  bandit_init_info = bandit_init_info,
+  batch_size = batch_size,
+  obs_each = obs_each,
+  t_min = t_min
+)
+```
+
+```{r}
+fig4 <- sim_df4 %>% plot_regret_graph(facet = FALSE, t_min = t_min) +
+  guides(
+    x = guide_prism_minor(),
+    y = guide_prism_minor()
+  ) +
+  theme(
+    legend.position = c(0.3, 0.7), legend.title = element_blank(),
+    legend.background = element_rect(fill = NA, color = NA),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  ) +
+  labs(
+    y = "Regret",
+    x = "Round t"
+  )
+
+fig4
+ggsave("figure/low_cvr_bandit_comparison.png", fig4, width = 4, height = 3)
+
+print(sim_df4 %>% plot_estimated_graph())
+```
+
+```{r cache=T, message=FALSE}
+sim_df4_bayesian <- repeat_simulation(N_sim, p_click, p_c,
+  lambda_delay = lambda_delay,
+  bandit_algo_list = bandit_algo_list_w_bayesian,
+  bandit_init_info = bandit_init_info,
+  batch_size = batch_size,
+  obs_each = obs_each,
+  t_min = t_min
+)
+sim_df4_bayesian %>% write_rds("figure/low_cvr_bandit_comparison_with_bayesian.rds")
+```
+
+```{r}
+fig4_bayesian <- sim_df4_bayesian %>% plot_regret_graph(facet = FALSE, t_min = t_min) +
+  guides(
+    x = guide_prism_minor(),
+    y = guide_prism_minor()
+  ) +
+  theme(
+    legend.position = c(0.3, 0.7), legend.title = element_blank(),
+    legend.background = element_rect(fill = NA, color = NA),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  ) +
+  labs(
+    y = "Regret",
+    x = "Round t"
+  )
+
+fig4_bayesian
+
+ggsave("figure/low_cvr_bandit_comparison_with_bayesian.png", fig4_bayesian, width = 4, height = 3)
+```
+
+
+```{r weibull, cache=TRUE, message=FALSE}
+
+######## USE weibull distribution
+p_click <- c(1, 1, 1)
+p_c <- c(0.1, 0.05, 0.03)
+lambda_delay <- c(1 / 1000, 1 / 750, 1 / 500)
+m <- Inf
+batch_size <- 500
+
+obs_each <- 10000
+t_min <- 100
+
+N_sim <- 50
+
+sim_df8 <- repeat_simulation(N_sim, p_click, p_c,
+  lambda_delay = lambda_delay,
+  bandit_algo_list = bandit_algo_list,
+  bandit_init_info = bandit_init_info,
+  batch_size = batch_size,
+  obs_each = obs_each,
+  weibull = T,
+  t_min = t_min
+)
+```
+
+
+```{r}
+fig8 <- sim_df8 %>% plot_regret_graph(facet = FALSE, t_min = t_min) +
+  guides(
+    x = guide_prism_minor(),
+    y = guide_prism_minor()
+  ) +
+  theme(
+    legend.position = c(0.3, 0.7), legend.title = element_blank(),
+    legend.background = element_rect(fill = NA, color = NA),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  ) +
+  labs(
+    y = "Regret",
+    x = "Round t"
+  )
+fig8
+ggsave("figure/weibull_bandit_comparison.png", fig8, width = 4, height = 3)
+
+# sim_df8%>%plot_estimated_graph()
+```
+
+```{r cache=T, message=FALSE}
+sim_df8_bayesian <- repeat_simulation(N_sim, p_click, p_c,
+  lambda_delay = lambda_delay,
+  bandit_algo_list = bandit_algo_list_w_bayesian,
+  bandit_init_info = bandit_init_info,
+  batch_size = batch_size,
+  obs_each = obs_each,
+  weibull = T,
+  t_min = t_min
+)
+sim_df8_bayesian %>% write_rds("figure/weibull_bandit_comparison_with_bayesian.rds")
+```
+
+```{r}
+fig8_bayesian <- sim_df8_bayesian %>% plot_regret_graph(facet = FALSE, t_min = t_min) +
+  guides(
+    x = guide_prism_minor(),
+    y = guide_prism_minor()
+  ) +
+  theme(
+    legend.position = c(0.3, 0.7), legend.title = element_blank(),
+    legend.background = element_rect(fill = NA, color = NA),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  ) +
+  labs(
+    y = "Regret",
+    x = "Round t"
+  )
+
+fig8_bayesian
+
+ggsave("figure/weibull_bandit_comparison_with_bayesian.png", fig8_bayesian, width = 4, height = 3)
+```
+
+
+```{r criteo, cache=T, message=FALSE}
+############# Use synthetic data
+# p_click=c(0.6, 0.5, 0.4)
+p_click <- c(1, 1, 1)
+p_c <- c(0.5, 0.4, 0.3)
+lambda_delay <- c(1 / 1000, 1 / 750, 1 / 500)
+
+bandit_init_info <- list(
+  lambda_prior = lambda_prior,
+  theta_prior = theta_prior
+)
+
+obs_each <- 50000
+sim_df9 <- repeat_simulation(N_sim, p_click, p_c,
+  lambda_delay = lambda_delay,
+  bandit_algo_list = bandit_algo_list,
+  bandit_init_info = bandit_init_info,
+  batch_size = batch_size,
+  obs_each = obs_each,
+  synthetic_data = T,
+  t_min = t_min
+)
+```
+
+```{r}
+fig9 <- sim_df9 %>% plot_regret_graph(facet = FALSE, t_min = t_min) +
+  guides(
+    x = guide_prism_minor(),
+    y = guide_prism_minor()
+  ) +
+  theme(
+    legend.position = c(0.3, 0.7), legend.title = element_blank(),
+    legend.background = element_rect(fill = NA, color = NA),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  ) +
+  labs(
+    y = "Regret",
+    x = "Round t"
+  )
+
+fig9
+
+ggsave("figure/criteo_bandit_comparison.png", fig9, width = 4, height = 3)
+
+sim_df9 %>% plot_estimated_graph()
+```
+
+```{r, cache=T, message=FALSE}
+sim_df9_bayesian <- repeat_simulation(N_sim, p_click, p_c,
+  lambda_delay = lambda_delay,
+  bandit_algo_list = bandit_algo_list_w_bayesian,
+  bandit_init_info = bandit_init_info,
+  batch_size = batch_size,
+  obs_each = obs_each,
+  synthetic_data = T,
+  t_min = t_min
+)
+sim_df9_bayesian %>% write_rds("figure/criteo_bandit_comparison_with_bayesian.rds")
+```
+
+```{r}
+fig9_bayesian <- sim_df9_bayesian %>% plot_regret_graph(facet = FALSE, t_min = t_min) +
+  guides(
+    x = guide_prism_minor(),
+    y = guide_prism_minor()
+  ) +
+  theme(
+    legend.position = c(0.3, 0.7), legend.title = element_blank(),
+    legend.background = element_rect(fill = NA, color = NA),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank()
+  ) +
+  labs(
+    y = "Regret",
+    x = "Round t"
+  )
+
+fig9_bayesian
+
+ggsave("figure/criteo_bandit_comparison_with_bayesian.png", fig9_bayesian, width = 4, height = 3)
+```
